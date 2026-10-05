@@ -196,13 +196,14 @@ export default function CellularDriverLabPage() {
         addLog(
           'NET',
           'warn',
-          `🔄 تبديل واجهة الشبكة: من [${prevType}] إلى [${currentType}] - جاري استئناف البث ومزامنة الطابور`
+          `🔄 تبديل واجهة الشبكة: من [${prevType}] إلى [${currentType}] - تفعيل فترة امتصاص صدمة الإشعارات (10 ثوانٍ)`
         );
         previousNetTypeRef.current = currentType;
-        // إعطاء مهلة ثانية واحدة لاستقرار شبكة الجوال الجديدة ثم تفريغ الطابور
+        // إعطاء مهلة 10 ثوانٍ لامتصاص هجوم إشعارات التطبيقات الأخرى ثم تفريغ الطابور دفعة واحدة
         setTimeout(() => {
+          addLog('SYNC', 'info', '🏁 انتهت فترة امتصاص الصدمة - جاري بدء تفريغ ومزامنة الطابور');
           flushQueue();
-        }, 1200);
+        }, 10000);
       } else {
         previousNetTypeRef.current = currentType;
       }
@@ -262,6 +263,7 @@ export default function CellularDriverLabPage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ batch: queued }),
+        keepalive: true,
       });
 
       if (res.ok) {
@@ -304,13 +306,27 @@ export default function CellularDriverLabPage() {
       inFlightRef.current = true;
       const t0 = performance.now();
       try {
+        // تجهيز الـ Micro-Payload المضغوط (حجم ~65 بايت فقط بدلاً من 350 بايت)
+        const microPayload = {
+          v: payload.vehicleId,
+          c: [payload.lat, payload.lng],
+          s: payload.speed,
+          h: payload.heading,
+          a: payload.accuracy,
+          t: payload.timestamp,
+          q: payload.clientSeq,
+        };
+
         const res = await fetch('/api/telemetry', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             'Cache-Control': 'no-cache',
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(microPayload),
+          keepalive: true,
+          // @ts-ignore - priority hint for modern browsers
+          priority: 'high',
         });
 
         const t1 = performance.now();
