@@ -93,7 +93,9 @@ export default function CellularDriverLabPage() {
   const [logFilter, setLogFilter] = useState<'all' | 'error' | 'net'>('all');
   const [copySuccess, setCopySuccess] = useState(false);
 
-  // ── المراجع (Refs) ──
+  // ── المراجع والتحكم التكيفي ──
+  const [adaptiveMode, setAdaptiveMode] = useState(true);
+  const [swReady, setSwReady] = useState(false);
   const watchIdRef = useRef<number | null>(null);
   const wakeLockRef = useRef<any>(null);
   const clientSeqRef = useRef<number>(0);
@@ -102,6 +104,8 @@ export default function CellularDriverLabPage() {
   const sseEventSourceRef = useRef<EventSource | null>(null);
   const socketRef = useRef<any>(null);
   const latencySamplesRef = useRef<number[]>([]);
+  const inFlightRef = useRef<boolean>(false);
+  const previousNetTypeRef = useRef<string | undefined>(undefined);
 
   // ── وظيفة إضافة سجل تشخيص ──
   const addLog = useCallback(
@@ -160,13 +164,49 @@ export default function CellularDriverLabPage() {
     }
   }, [addLog]);
 
-  // ── مراقبة حالة الشبكة وتحديث المؤشرات ──
+  // ── تسجيل الـ Service Worker لتشغيل التطبيق Offline فورياً ──
   useEffect(() => {
-    setNetDiag(getNetworkDiagnostics());
+    if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker
+        .register('/sw.js')
+        .then(() => {
+          setSwReady(true);
+          addLog('STORAGE', 'success', '🚀 تم تفعيل الـ Service Worker (التطبيق جاهز للعمل من الذاكرة فوراً)');
+        })
+        .catch((err) => {
+          addLog('STORAGE', 'warn', `تعذر تسجيل Service Worker: ${err.message}`);
+        });
+    }
+  }, [addLog]);
+
+  // ── مراقبة حالة الشبكة وتحديث المؤشرات والتعامل مع الانتقال بين Wi-Fi والبيانات ──
+  useEffect(() => {
+    const initialDiag = getNetworkDiagnostics();
+    setNetDiag(initialDiag);
+    previousNetTypeRef.current = initialDiag.type || initialDiag.effectiveType;
     getQueueCount().then(setOfflineCount);
 
     const unsubscribe = subscribeToNetworkChanges((diag) => {
       setNetDiag(diag);
+
+      // رصد لحظة الانتقال بين الواي فاي وبيانات الهاتف (Handover)
+      const prevType = previousNetTypeRef.current;
+      const currentType = diag.type || diag.effectiveType;
+      if (prevType && prevType !== currentType) {
+        addLog(
+          'NET',
+          'warn',
+          `🔄 تبديل واجهة الشبكة: من [${prevType}] إلى [${currentType}] - جاري استئناف البث ومزامنة الطابور`
+        );
+        previousNetTypeRef.current = currentType;
+        // إعطاء مهلة ثانية واحدة لاستقرار شبكة الجوال الجديدة ثم تفريغ الطابور
+        setTimeout(() => {
+          flushQueue();
+        }, 1200);
+      } else {
+        previousNetTypeRef.current = currentType;
+      }
+
       addLog(
         'NET',
         diag.online ? 'success' : 'error',
@@ -175,7 +215,6 @@ export default function CellularDriverLabPage() {
           : '🚫 انقطعت الشبكة تماماً (Offline)'
       );
       if (diag.online) {
-        // محاولة تفريغ الطابور تلقائياً
         flushQueue();
       }
     });
@@ -247,8 +286,22 @@ export default function CellularDriverLabPage() {
   const dispatchTelemetry = async (payload: DriverTelemetryPayload) => {
     setMetrics((prev) => ({ ...prev, totalSent: prev.totalSent + 1 }));
 
-    // 1. مسار REST HTTP POST (الأساسي والأكثر ثباتاً)
+    // 1. مسار REST HTTP POST (الأساسي والأكثر ثباتاً مع حماية منع التصادم)
     if (transportMode === 'rest') {
+      // حماية ضد التصادم: إذا كانت هناك نبضة سابقة لا زالت معلقة على شبكة 2G البطيئة، لا نفتح ريكويست جديد يخنقه!
+      if (inFlightRef.current) {
+        addLog(
+          'STORAGE',
+          'warn',
+          `⚠️ الخط الخلوي مشغول بنبضة جارية - تم تحويل النبضة #${payload.clientSeq} لـ IndexedDB لتفادي السقوط`
+        );
+        await queueTelemetryPoint(payload);
+        const count = await getQueueCount();
+        setOfflineCount(count);
+        return;
+      }
+
+      inFlightRef.current = true;
       const t0 = performance.now();
       try {
         const res = await fetch('/api/telemetry', {
@@ -299,6 +352,13 @@ export default function CellularDriverLabPage() {
           `❌ فشلت النبضة #${payload.clientSeq}: ${err.message}`,
           'تم التخزين فوراً في IndexedDB'
         );
+      } finally {
+        inFlightRef.current = false;
+        // إذا تراكمت نقاط أثناء انشغال الخط، قم بمزامنتها دفعة واحدة بهدوء
+        const pendingCount = await getQueueCount();
+        if (pendingCount >= 3) {
+          flushQueue();
+        }
       }
     }
 
@@ -581,12 +641,21 @@ export default function CellularDriverLabPage() {
           {netDiag.online ? (
             <span className="flex items-center gap-1 text-emerald-400 font-bold text-[11px]">
               <Wifi className="h-3.5 w-3.5" />
-              <span>{netDiag.effectiveType ? netDiag.effectiveType.toUpperCase() : 'متصل'}</span>
+              <span>
+                {netDiag.type && netDiag.type !== 'unknown' ? `${netDiag.type.toUpperCase()} • ` : ''}
+                {netDiag.effectiveType ? netDiag.effectiveType.toUpperCase() : 'متصل'}
+              </span>
             </span>
           ) : (
             <span className="flex items-center gap-1 text-rose-400 font-bold text-[11px]">
               <WifiOff className="h-3.5 w-3.5" />
               <span>غير متصل (Offline)</span>
+            </span>
+          )}
+
+          {swReady && (
+            <span className="rounded-full bg-emerald-500/10 px-1.5 py-0.2 text-[9px] font-bold text-emerald-400 border border-emerald-500/20" title="التطبيق مخزن في ذاكرة الهاتف ويفتح فورياً بدون إنترنت">
+              ⚡ كاش فوري
             </span>
           )}
 
