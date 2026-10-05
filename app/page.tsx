@@ -53,11 +53,14 @@ export default function CellularDriverLabPage() {
   const [transportMode, setTransportMode] = useState<TransportMode>('rest');
   const [socketUrl, setSocketUrl] = useState('');
 
-  // ── حالات البث والاتصال ──
+  // ── حالات البث والاتصال والمهمة ──
   const [isBroadcasting, setIsBroadcasting] = useState(false);
   const [wakeLockActive, setWakeLockActive] = useState(false);
   const [netDiag, setNetDiag] = useState<NetworkDiagnostics>({ online: true });
   const [offlineCount, setOfflineCount] = useState(0);
+  const [taskStatus, setTaskStatus] = useState<'pending' | 'inprogress' | 'finished'>('pending');
+  const [isTaskActionLoading, setIsTaskActionLoading] = useState(false);
+  const [mapStressLoading, setMapStressLoading] = useState(false);
 
   // ── بيانات الـ GPS والرحلة ──
   const [currentCoords, setCurrentCoords] = useState<{
@@ -348,7 +351,8 @@ export default function CellularDriverLabPage() {
           addLog(
             'REST',
             'success',
-            `#${payload.clientSeq} نبضة مؤكدة (${latency}ms) - تأخير السيرفر: ${data.transitDelayMs}ms`
+            `✨ #${payload.clientSeq} نبضة مؤكدة [Micro ~65B] (${latency}ms) - تأخير السيرفر: ${data.transitDelayMs}ms`,
+            data.message
           );
         } else {
           throw new Error(`Server returned HTTP ${res.status}`);
@@ -591,6 +595,94 @@ export default function CellularDriverLabPage() {
     }
     setIsBroadcasting(false);
     addLog('GPS', 'info', 'تم إيقاف بث الـ GPS');
+  };
+
+  // ── محاكاة بدء المهمة بالتزامن مع بث الـ GPS ──
+  const handleStartTask = async () => {
+    setIsTaskActionLoading(true);
+    addLog('TASK' as any, 'info', 'جاري إرسال ريكويست بدء المهمة الميدانية...');
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/api/task/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'accept', taskId: 'DEMO-TASK-001' }),
+        keepalive: true,
+        // @ts-ignore
+        priority: 'high',
+      });
+      const t1 = performance.now();
+      const latency = Math.round(t1 - t0);
+      if (res.ok) {
+        const data = await res.json();
+        setTaskStatus('inprogress');
+        addLog('TASK' as any, 'success', `🚀 تم قبول وبدء المهمة (${latency}ms) - بدأ تتبع الـ GPS تلقائياً`, data.message);
+        if (!isBroadcasting) startBroadcasting();
+      } else {
+        throw new Error(`HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      addLog('TASK' as any, 'error', `❌ فشل ريكويست بدء المهمة: ${err.message}`);
+    } finally {
+      setIsTaskActionLoading(false);
+    }
+  };
+
+  // ── محاكاة إنهاء المهمة وتسجيل العداد ──
+  const handleFinishTask = async () => {
+    setIsTaskActionLoading(true);
+    addLog('TASK' as any, 'info', 'جاري إرسال ريكويست إنهاء المهمة وتسجيل عداد الكيلومتر...');
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/api/task/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'finish', taskId: 'DEMO-TASK-001', endOdometer: 1450 }),
+        keepalive: true,
+        // @ts-ignore
+        priority: 'high',
+      });
+      const t1 = performance.now();
+      const latency = Math.round(t1 - t0);
+      if (res.ok) {
+        const data = await res.json();
+        setTaskStatus('finished');
+        addLog('TASK' as any, 'success', `🏁 تم تسليم وإنهاء المهمة وتوليد الملخص (${latency}ms)`, data.message);
+        stopBroadcasting();
+      } else {
+        throw new Error(`HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      addLog('TASK' as any, 'error', `❌ فشل ريكويست إنهاء المهمة: ${err.message}`);
+    } finally {
+      setIsTaskActionLoading(false);
+    }
+  };
+
+  // ── محاكاة تحميل الخريطة (بلاطات صور 250KB) لاختبار أثرها على نبضات الـ GPS ──
+  const handleSimulateMapStress = async () => {
+    setMapStressLoading(true);
+    addLog('NET', 'warn', '🗺️ بدء محاكاة تحميل الخريطة (تحميل 250KB بيانات عبر شبكة الجوال)...');
+    const t0 = performance.now();
+    try {
+      const res = await fetch('/api/simulate/map-tiles?kb=250', { cache: 'no-store' });
+      const t1 = performance.now();
+      const latency = Math.round(t1 - t0);
+      if (res.ok) {
+        const text = await res.text();
+        const sizeKb = Math.round(text.length / 1024);
+        addLog(
+          'NET',
+          'info',
+          `✅ اكتمل تحميل محاكاة الخريطة (${sizeKb}KB استغرقت ${latency}ms)`,
+          `سرعة التنزيل الفعلية: ${((sizeKb * 8) / (latency / 1000)).toFixed(1)} Kbps`
+        );
+      }
+    } catch (err: any) {
+      addLog('NET', 'error', `❌ فشل تحميل الخريطة: ${err.message}`);
+    } finally {
+      setMapStressLoading(false);
+    }
   };
 
   // ── تصدير تقرير التشخيص ──
@@ -845,15 +937,27 @@ export default function CellularDriverLabPage() {
           </div>
         </div>
 
-        {/* ── بطاقة المهمة الجارية (محاكاة زمام) ── */}
+        {/* ── بطاقة المهمة الجارية (محاكاة زمام الميدانية) ── */}
         <div className="rounded-2xl border border-slate-800 bg-slate-900 p-3.5 space-y-2.5">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-xs font-bold text-slate-300">
               <Route className="h-4 w-4 text-teal-400" />
               <span>مهمة التوصيل الميدانية</span>
             </div>
-            <span className="rounded-full bg-teal-500/10 px-2 py-0.5 text-[10px] font-bold text-teal-400 border border-teal-500/20">
-              قيد التنفيذ 🟢
+            <span
+              className={`rounded-full px-2 py-0.5 text-[10px] font-bold border ${
+                taskStatus === 'inprogress'
+                  ? 'bg-teal-500/10 text-teal-400 border-teal-500/20'
+                  : taskStatus === 'finished'
+                  ? 'bg-blue-500/10 text-blue-400 border-blue-500/20'
+                  : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+              }`}
+            >
+              {taskStatus === 'inprogress'
+                ? 'قيد التنفيذ 🟢'
+                : taskStatus === 'finished'
+                ? 'مكتملة 🏁'
+                : 'في الانتظار ⏳'}
             </span>
           </div>
 
@@ -868,6 +972,40 @@ export default function CellularDriverLabPage() {
               <span className="text-slate-400 text-[11px]">التسليم:</span>
               <span className="font-semibold truncate">نقطة توزيع حي النرجس</span>
             </div>
+          </div>
+
+          {/* أزرار العمليات الميدانية المتزامنة */}
+          <div className="flex items-center gap-2 pt-1">
+            {taskStatus === 'pending' && (
+              <button
+                onClick={handleStartTask}
+                disabled={isTaskActionLoading}
+                className="flex-1 flex items-center justify-center gap-1.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-bold py-2 text-xs transition-all active:scale-95 cursor-pointer"
+              >
+                <Play className="h-3.5 w-3.5 fill-current" />
+                <span>{isTaskActionLoading ? 'جاري البدء...' : 'بدء المهمة 🚀'}</span>
+              </button>
+            )}
+
+            {taskStatus === 'inprogress' && (
+              <button
+                onClick={handleFinishTask}
+                disabled={isTaskActionLoading}
+                className="flex-1 flex items-center justify-center gap-1.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 text-xs transition-all active:scale-95 cursor-pointer"
+              >
+                <CheckCircle2 className="h-3.5 w-3.5" />
+                <span>{isTaskActionLoading ? 'جاري الإنهاء...' : 'تسليم وإنهاء المهمة 🏁'}</span>
+              </button>
+            )}
+
+            <button
+              onClick={handleSimulateMapStress}
+              disabled={mapStressLoading}
+              title="محاكاة تحميل بلاطات خريطة 250KB عبر شبكة الجوال لفحص تأثيرها على الـ GPS"
+              className="flex items-center justify-center gap-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 px-3 py-2 text-xs font-bold transition-all active:scale-95 cursor-pointer"
+            >
+              <span>🗺️ {mapStressLoading ? 'تحميل...' : 'ضغط الخريطة'}</span>
+            </button>
           </div>
         </div>
 
